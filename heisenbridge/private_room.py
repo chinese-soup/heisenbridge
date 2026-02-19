@@ -28,6 +28,12 @@ from heisenbridge.command_parse import CommandParser
 from heisenbridge.command_parse import CommandParserError
 from heisenbridge.room import Room
 
+import aiohttp
+
+# hardcoded hostname of my matrix instance,
+# so that I can just pass docker hostname of continuwuity to heisenbridge in docker-compose
+# and not the public hostname
+MEDIA_HOSTNAME = ""
 
 class NetworkRoom:
     pass
@@ -591,6 +597,36 @@ class PrivateRoom(Room):
         if self.network is None:
             return
 
+        raw_message = event.arguments[0]
+        # More permissive regex: looks for the link anywhere, ignores trailing garbage
+        match = re.search(r'(https?://\S+\.(?:png|jpg|jpeg|gif|webp))', raw_message, re.IGNORECASE)
+
+        if match:
+            url = match.group(1).strip()
+
+            async def upload_and_send_inline(target_url, room_id, nick):
+                try:
+                    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+                    async with aiohttp.ClientSession(headers=headers) as session:
+                        async with session.get(target_url, timeout=20) as resp:
+                            if resp.status == 200:
+                                content = await resp.read()
+
+                                irc_user_id = self.serv.irc_user_id(self.network.name, nick)
+                                intent = self.serv.az.intent.user(irc_user_id)
+
+                                mxc_url = await intent.upload_media(content, mime_type=resp.content_type)
+
+                                # Many versions use: send_image(room_id, url, text="...", info={})
+                                # To be safest, we'll try the most standard positional order
+                                await intent.send_image(room_id, mxc_url)
+                except Exception as e:
+                    import traceback
+                    print(f"DEBUG INLINE CRITICAL: {e}")
+                    traceback.print_exc()
+
+            asyncio.ensure_future(upload_and_send_inline(url, self.id, event.source.nick))
+
         irc_user_id = self.serv.irc_user_id(self.network.name, event.source.nick)
 
         (plain, formatted) = parse_irc_formatting(event.arguments[0], self.pills(), self.network.color)
@@ -852,9 +888,24 @@ class PrivateRoom(Room):
             await self._send_message(event, self.network.conn.action)
         elif str(event.content.msgtype) in ["m.image", "m.file", "m.audio", "m.video"]:
             if event.content.filename and event.content.filename != event.content.body:
-                new_body = self.serv.mxc_to_url(event.content.url, event.content.filename) + "\n" + event.content.body
+                mxc = event.content.url.replace("mxc://", "")
+                ext = ""
+                # Add fake extension to message so image previwers like Lith can detect it based on URL suffix match
+                if str(event.content.msgtype) == "m.image":
+                    ext = "/.JPEG"
+                elif str(event.content.msgtype) == "m.video":
+                    ext = "/.MP4"
+                new_body =  event.content.body + " " + f"https://{MEDIA_HOSTNAME}/_matrix/media/v3/download/{mxc}{ext}" 
             else:
-                new_body = self.serv.mxc_to_url(event.content.url, event.content.body)
+                ext = ""
+                mxc = event.content.url.replace("mxc://", "")
+                # Add fake extension to message so image previwers like Lith can detect it based on URL suffix match
+                if str(event.content.msgtype) == "m.image":
+                    ext = "/.JPEG"
+                elif str(event.content.msgtype) == "m.video":
+                    ext = "/.MP4"
+                new_body = f"https://{MEDIA_HOSTNAME}/_matrix/media/v3/download/{mxc}{ext}"
+                # new_body = self.serv.mxc_to_url(event.content.url, event.content.body)
             media_event = MessageEvent(
                 sender=event.sender,
                 type=None,
@@ -879,7 +930,40 @@ class PrivateRoom(Room):
                 finally:
                     return
 
+            body = event.content.body
+            fbody = getattr(event.content, "formatted_body", "") or ""
+
+            # 1. Handle the "Addressing" (The first word/pill)
+            mention_match = re.match(r'^<a href="[^>]+">([^<]+)</a>', fbody)
+
+            if mention_match:
+                # Extract first nick and strip its @
+                first_nick = mention_match.group(1).lstrip('@')
+
+                # Get everything after that first pill
+                suffix_parts = fbody.split('</a>', 1)
+                suffix_html = suffix_parts[1] if len(suffix_parts) > 1 else ""
+
+                # Strip remaining HTML tags
+                rest_of_msg = re.sub(r'<[^>]*>', '', suffix_html)
+
+                # SAFE REGEX: Use a capture group for start-of-string or space
+                # This replaces "@" or " @" with just the captured boundary
+                rest_of_msg = re.sub(r'(^|\s)@', r'\1', rest_of_msg)
+
+                body = f"{first_nick}: {rest_of_msg.lstrip()}"
+            else:
+                # 2. No pill at start, just do a global @ strip using the safe regex
+                body = re.sub(r'(^|\s)@', r'\1', body).strip()
+
+            # 3. Apply the clean body and kill formatting
+            event.content.body = body
+            if hasattr(event.content, "formatted_body"):
+                event.content.formatted_body = None
+
+            # 4. Send the original event (which now contains our cleaned body)
             await self._send_message(event, self.network.conn.privmsg)
+            #await self._send_message(event, self.network.conn.privmsg)
 
         await self.az.intent.send_receipt(event.room_id, event.event_id)
 
